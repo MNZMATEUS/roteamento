@@ -174,7 +174,7 @@ with col_left:
     # Tabela de Locais
     if st.session_state['locais']:
         df = pd.DataFrame(st.session_state['locais'])
-        st.dataframe(df, height=150, hide_index=True)
+        st.dataframe(df, height=450, hide_index=True)
         if st.button("🗑️ Limpar Tudo"):
             st.session_state['locais'] = []
             st.rerun()
