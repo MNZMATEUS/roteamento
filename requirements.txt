@@ -1,0 +1,6 @@
+streamlit
+geopy
+pandas
+folium
+streamlit-folium
+ortools
