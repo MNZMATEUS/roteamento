@@ -9,64 +9,71 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Otimizador de Rotas Web", layout="wide")
+st.set_page_config(page_title="Otimizador de Rotas PRO", layout="wide")
 
-# Inicializar "memória" da sessão para guardar os endereços
+# Inicializar memória
 if 'locais' not in st.session_state:
     st.session_state['locais'] = []
 
-# --- 1. FUNÇÕES DE SUPORTE (GEOCODING & MATH) ---
+# --- 1. FUNÇÕES MATEMÁTICAS ---
 
 def buscar_coordenadas(endereco):
-    """Converte texto em (lat, long) usando OpenStreetMap"""
-    geolocator = Nominatim(user_agent="meu_app_rotas_mvp_v1")
+    """Converte texto em (lat, long)"""
+    geolocator = Nominatim(user_agent="app_rotas_mvp_v2")
     try:
-        location = geolocator.geocode(endereco)
+        # Limitamos a busca ao Brasil para melhorar precisão (pode remover se quiser mundial)
+        location = geolocator.geocode(endereco, country_codes="BR")
         if location:
             return location.latitude, location.longitude
         return None
     except:
         return None
 
-def calcular_distancia_haversine(lat1, lon1, lat2, lon2):
-    """Matemática para calcular distância em metros"""
+def calc_dist(lat1, lon1, lat2, lon2):
+    """Haversine simples em Metros"""
     R = 6371000 
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    # Fator 1.4 para compensar tortuosidade das ruas
-    return int(2 * R * math.asin(math.sqrt(a)) * 1.4)
+    # Fator 1.3 de tortuosidade (ruas não são retas)
+    return int(2 * R * math.asin(math.sqrt(a)) * 1.3)
+
+def calcular_rota_original_sequencial(lista):
+    """Calcula a distância se o motorista seguisse a ordem da lista sem otimizar"""
+    if len(lista) < 2: return 0
+    dist_total = 0
+    # De 0 para 1, 1 para 2, etc... e volta para 0
+    for i in range(len(lista) - 1):
+        dist_total += calc_dist(lista[i]['lat'], lista[i]['lon'], lista[i+1]['lat'], lista[i+1]['lon'])
+    # Volta ao depósito
+    dist_total += calc_dist(lista[-1]['lat'], lista[-1]['lon'], lista[0]['lat'], lista[0]['lon'])
+    return dist_total
 
 # --- 2. SOLVER (OR-TOOLS) ---
-def resolver_rota(lista_locais, num_veiculos):
-    # Preparar Matriz
+def resolver_otimizacao(lista_locais, num_veiculos):
     tamanho = len(lista_locais)
     matriz = [[0] * tamanho for _ in range(tamanho)]
     
+    # Criar Matriz de Distâncias
     for i in range(tamanho):
         for j in range(tamanho):
             if i != j:
-                matriz[i][j] = calcular_distancia_haversine(
+                matriz[i][j] = calc_dist(
                     lista_locais[i]['lat'], lista_locais[i]['lon'],
                     lista_locais[j]['lat'], lista_locais[j]['lon']
                 )
     
-    # Configurar OR-Tools
-    manager = pywrapcp.RoutingIndexManager(tamanho, num_veiculos, 0) # 0 é o depósito
+    manager = pywrapcp.RoutingIndexManager(tamanho, num_veiculos, 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return matriz[from_node][to_node]
+        return matriz[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
 
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
-    # Adicionar dimensão de distância para equilibrar (opcional)
-    routing.AddDimension(transit_callback_index, 0, 3000000, True, 'Distance')
-    
+    # Estratégia de Busca
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -74,95 +81,147 @@ def resolver_rota(lista_locais, num_veiculos):
 
     solution = routing.SolveWithParameters(search_parameters)
     
-    rotas = []
+    resultados = []
+    distancia_total_otimizada = 0
+
     if solution:
         for vehicle_id in range(num_veiculos):
             index = routing.Start(vehicle_id)
-            rota_atual = []
+            rota_nomes = []
+            rota_coords = []
+            distancia_rota = 0
+            
             while not routing.IsEnd(index):
                 node_index = manager.IndexToNode(index)
-                rota_atual.append(lista_locais[node_index])
+                rota_nomes.append(lista_locais[node_index]['nome'])
+                rota_coords.append([lista_locais[node_index]['lat'], lista_locais[node_index]['lon']])
+                
+                previous_index = index
                 index = solution.Value(routing.NextVar(index))
+                distancia_rota += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
             
-            # Adicionar o retorno ao depósito
+            # Adicionar retorno ao depósito
             node_index = manager.IndexToNode(index)
-            rota_atual.append(lista_locais[node_index]) 
-            rotas.append(rota_atual)
+            rota_nomes.append(lista_locais[node_index]['nome']) # Volta pro inicio
+            rota_coords.append([lista_locais[node_index]['lat'], lista_locais[node_index]['lon']])
             
-    return rotas
+            resultados.append({
+                "veiculo": vehicle_id + 1,
+                "passos": rota_nomes,
+                "coords": rota_coords,
+                "distancia_m": distancia_rota
+            })
+            distancia_total_otimizada += distancia_rota
+            
+    return resultados, distancia_total_otimizada
 
-# --- 3. INTERFACE VISUAL (STREAMLIT) ---
+# --- 3. FRONTEND ---
 
-st.title("🚛 Otimizador de Rotas (Endereço Real)")
-st.markdown("Adicione endereços. O primeiro será considerado o **DEPÓSITO** (Ponto de Partida).")
+st.title("🚛 Otimizador de Rotas MVP")
+st.markdown("**Regra:** O primeiro endereço da lista é sempre considerado a **Garagem/Depósito**.")
 
-col1, col2 = st.columns([1, 2])
+col_left, col_right = st.columns([1, 1.5])
 
-with col1:
-    # Input de Endereço
-    endereco_input = st.text_input("Digite o endereço completo:", placeholder="Ex: Av. Paulista, 1578, São Paulo")
-    
-    if st.button("Adicionar à Lista"):
-        if endereco_input:
-            with st.spinner('Buscando coordenadas...'):
-                coords = buscar_coordenadas(endereco_input)
-                if coords:
-                    st.session_state['locais'].append({
-                        "nome": endereco_input,
-                        "lat": coords[0],
-                        "lon": coords[1]
-                    })
-                    st.success(f"Encontrado: {coords}")
-                else:
-                    st.error("Endereço não encontrado. Tente adicionar cidade e estado.")
+with col_left:
+    st.info("Passo 1: Cadastre os locais")
+    input_end = st.text_input("Novo Endereço:", placeholder="Ex: Av Paulista, 1000, SP")
+    if st.button("➕ Adicionar") and input_end:
+        coords = buscar_coordenadas(input_end)
+        if coords:
+            st.session_state['locais'].append({"nome": input_end, "lat": coords[0], "lon": coords[1]})
+            st.success("Adicionado!")
+        else:
+            st.error("Não achei. Tente colocar Cidade/Estado.")
 
-    # Lista de Pontos
-    st.write("### 📍 Pontos a visitar:")
-    if len(st.session_state['locais']) > 0:
-        df_locais = pd.DataFrame(st.session_state['locais'])
-        st.dataframe(df_locais[['nome', 'lat', 'lon']], hide_index=True)
-        
-        if st.button("Limpar Lista"):
+    # Tabela de Locais
+    if st.session_state['locais']:
+        df = pd.DataFrame(st.session_state['locais'])
+        st.dataframe(df, height=150, hide_index=True)
+        if st.button("🗑️ Limpar Tudo"):
             st.session_state['locais'] = []
             st.rerun()
 
-    # Configuração da Frota
-    num_veiculos = st.slider("Número de Veículos", 1, 5, 1)
-    botao_calcular = st.button("🚀 Calcular Melhor Rota", type="primary")
-
-with col2:
-    # Mapa Inicial (ou Resultado)
-    m = folium.Map(location=[-23.5505, -46.6333], zoom_start=11)
+    st.write("---")
+    st.info("Passo 2: Configurar e Calcular")
+    n_veiculos = st.slider("Quantos veículos?", 1, 5, 1)
     
-    # Desenhar pontos existentes
-    for i, local in enumerate(st.session_state['locais']):
-        icone = "home" if i == 0 else "info-sign"
-        cor = "black" if i == 0 else "blue"
-        folium.Marker(
-            [local['lat'], local['lon']], 
-            popup=local['nome'],
-            icon=folium.Icon(color=cor, icon=icone)
-        ).add_to(m)
-
-    # SE CLICOU EM CALCULAR
-    if botao_calcular and len(st.session_state['locais']) > 1:
-        with st.spinner('Otimizando rotas...'):
-            rotas_finais = resolver_rota(st.session_state['locais'], num_veiculos)
-            
-            cores = ['red', 'green', 'blue', 'orange', 'purple']
-            
-            for i, rota in enumerate(rotas_finais):
-                coords_rota = [[p['lat'], p['lon']] for p in rota]
+    # BOTÃO PRINCIPAL
+    if st.button("🚀 OTIMIZAR AGORA", type="primary"):
+        if len(st.session_state['locais']) < 2:
+            st.warning("Adicione pelo menos 2 locais (Depósito + 1 Cliente).")
+        else:
+            with st.spinner("A IA está calculando as rotas..."):
+                # 1. Calcular Otimizado
+                rotas_finais, dist_otimizada = resolver_otimizacao(st.session_state['locais'], n_veiculos)
                 
-                # Desenhar linha da rota
-                folium.PolyLine(
-                    coords_rota, 
-                    color=cores[i % len(cores)], 
-                    weight=5, 
-                    opacity=0.8,
-                    tooltip=f"Veículo {i+1}"
-                ).add_to(m)
+                # 2. Calcular "Jeito Burro" (Sequencial) para comparar
+                dist_original = calcular_rota_original_sequencial(st.session_state['locais'])
                 
-                st.toast(f"Veículo {i+1}: {len(rota)-2} entregas agendadas.")
+                # Guardar resultado na sessão para não sumir
+                st.session_state['resultado'] = {
+                    'rotas': rotas_finais,
+                    'dist_otimizada': dist_otimizada,
+                    'dist_original': dist_original
+                }
 
-    st_folium(m, width="100%", height=600)
+# --- EXIBIÇÃO DE RESULTADOS (FORA DAS COLUNAS PARA OCUPAR LARGURA TOTAL) ---
+
+if 'resultado' in st.session_state and st.session_state['locais']:
+    res = st.session_state['resultado']
+    
+    st.write("---")
+    st.subheader("📊 Relatório de Performance")
+    
+    # Métricas de Economia
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Distância Original (Sequencial)", f"{res['dist_original']/1000:.1f} km")
+    c2.metric("Distância Otimizada (IA)", f"{res['dist_otimizada']/1000:.1f} km")
+    
+    economia = res['dist_original'] - res['dist_otimizada']
+    c3.metric("Economia Estimada", f"{economia/1000:.1f} km", delta_color="normal")
+
+    # Mapa e Texto lado a lado
+    r_col1, r_col2 = st.columns([1, 1])
+    
+    with r_col1:
+        st.write("### 📝 Detalhes das Rotas")
+        for rota in res['rotas']:
+            with st.expander(f"🚛 Veículo {rota['veiculo']} ({rota['distancia_m']/1000:.1f} km)", expanded=True):
+                # Formatar a lista de passos com setinhas
+                html_steps = ""
+                for i, passo in enumerate(rota['passos']):
+                    icone = "🏠" if (i==0 or i==len(rota['passos'])-1) else f"{i}."
+                    html_steps += f"**{icone}** {passo}<br>⬇️<br>"
+                
+                st.markdown(html_steps[:-8], unsafe_allow_html=True) # Remove ultimo setinha
+                
+    with r_col2:
+        # Mapa Resultante
+        m = folium.Map(location=[st.session_state['locais'][0]['lat'], st.session_state['locais'][0]['lon']], zoom_start=12)
+        colors = ['red', 'blue', 'green', 'purple', 'orange']
+        
+        for rota in res['rotas']:
+            cor = colors[(rota['veiculo']-1) % len(colors)]
+            
+            # Linha da rota
+            folium.PolyLine(rota['coords'], color=cor, weight=5, opacity=0.8).add_to(m)
+            
+            # Marcadores numerados
+            for i, coord in enumerate(rota['coords']):
+                 # Ignora ultimo ponto (que é o retorno ao deposito) para não duplicar marker
+                if i < len(rota['coords']) - 1:
+                    folium.Marker(
+                        coord, 
+                        popup=rota['passos'][i],
+                        icon=folium.Icon(color=cor, icon="cloud" if i==0 else "info-sign")
+                    ).add_to(m)
+
+        st_folium(m, width="100%", height=500)
+
+elif st.session_state['locais']:
+    # Mostrar mapa vazio se ainda não calculou
+    with col_right:
+        m_start = folium.Map(location=[st.session_state['locais'][0]['lat'], st.session_state['locais'][0]['lon']], zoom_start=12)
+        for loc in st.session_state['locais']:
+            folium.Marker([loc['lat'], loc['lon']], popup=loc['nome']).add_to(m_start)
+        st_folium(m_start, width="100%", height=400)
