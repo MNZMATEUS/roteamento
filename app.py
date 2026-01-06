@@ -78,7 +78,7 @@ def resolver_otimizacao(lista_locais, num_veiculos, capacidade_veiculo):
     # Definimos que cada local (exceto depósito) pesa "1 unidade"
     def demand_callback(from_index):
         # Se for o nó 0 (depósito), demanda é 0. Senão, é 1.
-        return 0 if from_index == 0 else 1
+        return 0 if from_index == 0 else 2
 
     demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
     
