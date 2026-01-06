@@ -51,11 +51,11 @@ def calcular_rota_original_sequencial(lista):
     return dist_total
 
 # --- 2. SOLVER (OR-TOOLS) ---
-def resolver_otimizacao(lista_locais, num_veiculos):
+def resolver_otimizacao(lista_locais, num_veiculos, capacidade_veiculo):
     tamanho = len(lista_locais)
     matriz = [[0] * tamanho for _ in range(tamanho)]
     
-    # Criar Matriz de Distâncias
+    # 1. Matriz de Distâncias
     for i in range(tamanho):
         for j in range(tamanho):
             if i != j:
@@ -67,17 +67,49 @@ def resolver_otimizacao(lista_locais, num_veiculos):
     manager = pywrapcp.RoutingIndexManager(tamanho, num_veiculos, 0)
     routing = pywrapcp.RoutingModel(manager)
 
+    # 2. Callback de Distância
     def distance_callback(from_index, to_index):
         return matriz[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
 
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
-    # Estratégia de Busca
+    # --- A MÁGICA ACONTECE AQUI: RESTRIÇÃO DE CAPACIDADE ---
+    # Definimos que cada local (exceto depósito) pesa "1 unidade"
+    def demand_callback(from_index):
+        # Se for o nó 0 (depósito), demanda é 0. Senão, é 1.
+        return 0 if from_index == 0 else 1
+
+    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+    
+    routing.AddDimensionWithVehicleCapacity(
+        demand_callback_index,
+        0,  # null capacity slack
+        [capacidade_veiculo] * num_veiculos,  # capacidade de cada veículo
+        True,  # começar do zero
+        'Capacity'
+    )
+    # -------------------------------------------------------
+
+    # Dimensão de Distância (Mantemos para tentar equilibrar o esforço)
+    routing.AddDimension(
+        transit_callback_index, 
+        0, 
+        3000000, 
+        True, 
+        'Distance'
+    )
+    dist_dimension = routing.GetDimensionOrDie('Distance')
+    # Esse coeficiente tenta forçar que ninguém trabalhe muito mais que o outro
+    dist_dimension.SetGlobalSpanCostCoefficient(100)
+
+    # Parâmetros de Busca
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = (
         routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     )
+    # Adicionar limite de tempo para não travar se for complexo
+    search_parameters.time_limit.seconds = 5
 
     solution = routing.SolveWithParameters(search_parameters)
     
@@ -90,9 +122,12 @@ def resolver_otimizacao(lista_locais, num_veiculos):
             rota_nomes = []
             rota_coords = []
             distancia_rota = 0
+            carga_transportada = 0
             
             while not routing.IsEnd(index):
                 node_index = manager.IndexToNode(index)
+                carga_transportada += 0 if node_index == 0 else 1 # Contar carga
+                
                 rota_nomes.append(lista_locais[node_index]['nome'])
                 rota_coords.append([lista_locais[node_index]['lat'], lista_locais[node_index]['lon']])
                 
@@ -100,18 +135,21 @@ def resolver_otimizacao(lista_locais, num_veiculos):
                 index = solution.Value(routing.NextVar(index))
                 distancia_rota += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
             
-            # Adicionar retorno ao depósito
-            node_index = manager.IndexToNode(index)
-            rota_nomes.append(lista_locais[node_index]['nome']) # Volta pro inicio
-            rota_coords.append([lista_locais[node_index]['lat'], lista_locais[node_index]['lon']])
-            
-            resultados.append({
-                "veiculo": vehicle_id + 1,
-                "passos": rota_nomes,
-                "coords": rota_coords,
-                "distancia_m": distancia_rota
-            })
-            distancia_total_otimizada += distancia_rota
+            # Se o veículo saiu do lugar (tem mais que 1 ponto = depósito), adiciona
+            if len(rota_nomes) > 1:
+                # Adicionar retorno
+                node_index = manager.IndexToNode(index)
+                rota_nomes.append(lista_locais[node_index]['nome'])
+                rota_coords.append([lista_locais[node_index]['lat'], lista_locais[node_index]['lon']])
+                
+                resultados.append({
+                    "veiculo": vehicle_id + 1,
+                    "passos": rota_nomes,
+                    "coords": rota_coords,
+                    "distancia_m": distancia_rota,
+                    "carga": carga_transportada
+                })
+                distancia_total_otimizada += distancia_rota
             
     return resultados, distancia_total_otimizada
 
@@ -142,22 +180,28 @@ with col_left:
             st.rerun()
 
     st.write("---")
-    st.info("Passo 2: Configurar e Calcular")
-    n_veiculos = st.slider("Quantos veículos?", 1, 5, 1)
+    st.info("Passo 2: Configurar Frota")
+    
+    c_col1, c_col2 = st.columns(2)
+    with c_col1:
+        n_veiculos = st.slider("🚙 Nº de Veículos", 1, 5, 2)
+    with c_col2:
+        # Dica: Se você tem 10 entregas, coloque capacidade 5 ou 6 para forçar usar 2 carros.
+        cap_veiculo = st.slider("📦 Capacidade (Entregas/Veículo)", 1, 20, 5)
     
     # BOTÃO PRINCIPAL
     if st.button("🚀 OTIMIZAR AGORA", type="primary"):
         if len(st.session_state['locais']) < 2:
-            st.warning("Adicione pelo menos 2 locais (Depósito + 1 Cliente).")
+            st.warning("Adicione pelo menos 2 locais.")
         else:
-            with st.spinner("A IA está calculando as rotas..."):
-                # 1. Calcular Otimizado
-                rotas_finais, dist_otimizada = resolver_otimizacao(st.session_state['locais'], n_veiculos)
+            with st.spinner("Calculando rotas e dividindo cargas..."):
+                # Passamos a CAPACIDADE agora
+                rotas_finais, dist_otimizada = resolver_otimizacao(
+                    st.session_state['locais'], n_veiculos, cap_veiculo
+                )
                 
-                # 2. Calcular "Jeito Burro" (Sequencial) para comparar
                 dist_original = calcular_rota_original_sequencial(st.session_state['locais'])
                 
-                # Guardar resultado na sessão para não sumir
                 st.session_state['resultado'] = {
                     'rotas': rotas_finais,
                     'dist_otimizada': dist_otimizada,
